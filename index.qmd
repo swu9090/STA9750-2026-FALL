@@ -2,12 +2,12 @@
 title: "STA 9750"
 ---
 ## About Me
+[LinkedIn](https://www.linkedin.com/in/stephanie-chia-ying-wu/)
 
 Hi! My name is Stephanie Wu, and I am currently pursuing a Master of Science in Artificial Intelligence and Business Analytics at Baruch College, with a concentration in Operations and Decision Analytics.
 
-I have a background in Fashion Business Management and professional experience as a Business Analyst in the fashion technology and retail analytics industry. I am interested in using data and technology to solve business problems and turn insights into practical strategies.
+I have a background in Fashion Business Management and professional experience as a Business Analyst in the fashion technology and retail analytics industry. I am interested in using data insights and technology to solve practical business problems in Strategy and Operation.
 
-This website will showcase my projects and work for STA 9750.
 
 
 ```{r}
@@ -30,10 +30,26 @@ leaflet() |>
   addPopups(baruch_longitude, baruch_latitude, 
             "I am a Master's student at <b>Baruch College</b>!")
 ```
-
+--------
 ```{r}
-#| include: false
-1+1
+#| echo: false
+#| message: false
+#| warning: false
+
+if(!require("leaflet")){
+    options(repos=c(CRAN="https://cloud.r-project.org"))
+    install.packages("leaflet")
+    stopifnot(require("leaflet"))
+}
+
+fit_longitude <- -73.9946
+fit_latitude  <- 40.7475
+
+leaflet() |>
+  addTiles() |>
+  setView(fit_longitude, fit_latitude, zoom=17) |>
+  addPopups(fit_longitude, fit_latitude, 
+            "I did my Bachelor's degree at <b>FIT</b>!")
 ```
 --------------
 Last Updated: `r format(Sys.time(), "%A %m %d, %Y at %H:%M%p")`
