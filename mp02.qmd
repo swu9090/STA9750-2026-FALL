@@ -1,7 +1,1166 @@
+---
+title: "Mini-Project #02: Identifying Environmentally Responsible US Public Transit Systems"
+author: "Chia-Ying (Stephanie) Wu, Executive Director of the Green Transit Alliance (GTA)"
+format:
+  html:
+    code-fold: true
+    code-tools: true
+    toc: true
+execute:
+  warning: false
+  message: false
+---
+# Which U.S. Transit Agencies Deliver the Greatest Climate Benefits?
+Public transit is part of everyday life for many New Yorkers, but how do its carbon emissions compare across agencies? This analysis combines electricity, fuel consumption, and passenger service data to evaluate transit emissions per boarding and per passenger mile. The Green Transit Alliance will use these measures to identify award winners and compare their performance with that of their peers.
 
-  ---
-  title: "Mini-Project Placeholder"
-  ---
+| Dataset | Source and report | Information provided | Purpose |
+|:---|:---|:---|:---|
+| **EIA_SEP_REPORT** | U.S. Energy Information Administration (EIA): **State Electricity Profiles** | Each state's electricity CO₂ emissions rate (lb/MWh), electricity price, generation, and primary energy source. | Estimate emissions from electricity used by transit agencies. |
+| **NTD_ENERGY** | National Transit Database (NTD): **Energy Consumption** report (**NTD Energy Usage**) | Fuel and electricity consumed by each transit agency and transportation mode. | Calculate emissions associated with transit energy use. |
+| **NTD_SERVICE** | National Transit Database (NTD): **Service by Agency** report | Passenger trips, passenger miles, and agency location. | Connect agencies to state electricity data and calculate emissions per trip and per passenger mile. |
+
+: Overview of the three datasets {#tbl-datasets}
+
+# Data Acquisition 
+## State Electricity Profiles
+We collected state electricity generation source and the associated CO2 emissions from the US Energy Information Administration site.
+```{r acquire-eia}
+library(tidyverse)
+library(stringr)
+library(httr2)
+library(rvest)
+
+get_eia_sep <- function(state, abbr){
+    library(tidyverse)
+    library(stringr)
+    library(httr2)
+    library(rvest)
+    library(fs)
   
-  This is a placeholder for STA9750 Mini-Project 2. Check back soon for more!
+    state_formatted <- str_to_lower(state) |> str_replace_all("\\s", "")
+    
+    dir_name <- fs::path("data", "mp02")
+    file_name <- fs::path(dir_name, state_formatted)
+    
+    fs::dir_create(dir_name, recurse=TRUE)
+    
+    if(!fs::file_exists(file_name)){
+        BASE_URL <- "https://www.eia.gov"
+        RESPONSE <- request(BASE_URL) |> 
+          req_url_path("electricity", 
+                       "state", 
+                       state_formatted) |>
+          req_headers(
+            `User-Agent` = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:149.0) Gecko/20100101 Firefox/149.0"
+            ) |>   
+          req_retry(
+                max_tries = 4, 
+          ) |>
+          req_perform(file_name)
+    
+        resp_check_status(RESPONSE)
+    }
+    
+    TABLE <- read_html(file_name) |> 
+        html_element("table") |> 
+        html_table() |>
+        mutate(Item = str_to_lower(Item))
+    
+    if("U.S. rank" %in% colnames(TABLE)){
+        TABLE <- TABLE |> rename(Rank = `U.S. rank`)
+    }
+    
+    CO2_MWh <- TABLE |> 
+        filter(Item == "carbon dioxide (lbs/mwh)") |>
+        pull(Value) |> 
+        str_replace_all(",", "") |>
+        as.numeric()
+    
+    PRIMARY <- TABLE |> 
+        filter(Item == "primary energy source") |> 
+        pull(Rank)
+    
+    RATE <- TABLE |>
+        filter(Item == "average retail price (cents/kwh)") |>
+        pull(Value) |>
+        as.numeric()
+    
+    GENERATION_MWh <- TABLE |>
+        filter(Item == "net generation (megawatthours)") |>
+        pull(Value) |>
+        str_replace_all(",", "") |>
+        as.numeric()
+    
+    data.frame(CO2_MWh               = CO2_MWh, 
+               primary_source        = PRIMARY,
+               electricity_price_MWh = RATE * 10, # / 100 cents to dollars &
+               # * 1000 kWh to MWH 
+               generation_MWh        = GENERATION_MWh, 
+               state                 = state, 
+               abbreviation          = abbr
+    )
+}
+
+EIA_SEP_REPORT <- map2(state.name, state.abb, get_eia_sep) |> list_rbind()
+```
+## Energy Consumption
+We obtained fuel and electricity consumption data for each transit agency and transportation mode to calculate their associated CO₂ emissions.
+
+💡Mode column: distinguishing transportation types operated by the same agency.
+```{r acquire-energy}
+load_ntd_energy <- function(){
+  library(readxl)
+  library(httr2)
+  library(tidyverse)
+  library(fs)
   
+  # Create 'data/mp02' directory if not already present
+  DATA_DIR <- fs::path("data", "mp02")
+  fs::dir_create(DATA_DIR, recurse=TRUE)
+
+  NTD_ENERGY_FILE <- fs::path(DATA_DIR, "2025_ntd_energy.xlsx")
+
+  if(!fs::file_exists(NTD_ENERGY_FILE)){
+    library(httr2)
+  
+    request("https://www.transit.dot.gov/") |>
+      req_url_path("sites",
+                   "fta.dot.gov",
+                   "files",
+                   "2026-09",
+                   "2025 Energy Consumption_260806.xlsx") |> 
+      req_headers(
+        `User-Agent` = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:149.0) Gecko/20100101 Firefox/149.0") |> 
+      req_perform(NTD_ENERGY_FILE)
+  }
+  
+  if(file.info(NTD_ENERGY_FILE)$size < 1e4){
+        cat("I was unable to download the NTD Energy File. Please try again.\n")
+        stop("Download failed. Please delete the corrupted file by running `unlink('data/mp02/2025_ntd_energy.xlsx')` and try again.")
+    }
+
+  to_numeric_fill_0 <- function(x){
+    x <- if_else(x == "-", NA, x)
+    replace_na(as.numeric(x), 0)
+  }
+
+  read_excel(NTD_ENERGY_FILE) |> 
+    select(-c(`Reporter Type`, 
+              `Reporting Module`, 
+              `Gallons of Other Fuel`, 
+              `Other Fuel Description`)) |>
+    mutate(across(-c(`Agency Name`, 
+                     `Mode`,
+                     `TOS`), 
+                  to_numeric_fill_0)) |>
+    group_by(`NTD ID`, `Mode`, `Agency Name`) |>
+    summarize(across(where(is.numeric), sum), 
+              .groups = "keep") |>
+    mutate(ENERGY = sum(c_across(c(where(is.numeric))))) |>
+    filter(ENERGY > 0) |>
+    select(-ENERGY) |>
+    ungroup()
+}
+
+NTD_ENERGY <- load_ntd_energy()
+```
+
+## Transit Service Provided
+We collected data describing how much transportation each transit agency provided in 2025.
+
+💡 **UPT (Unlinked Passenger Trips)** counts each boarding separately, including transfers, according to the [NTD glossary](https://www.transit.dot.gov/ntd/national-transit-database-ntd-glossary#U).
+```{r acquire-service}
+load_ntd_service <- function(){
+  library(httr2)
+  library(tidyverse)
+  library(fs)
+  
+  # Create 'data/mp02' directory if not already present
+  DATA_DIR <- fs::path("data", "mp02")
+  fs::dir_create(DATA_DIR, recurse=TRUE)
+
+  NTD_SERVICE_FILE <- fs::path(DATA_DIR, "2025_ntd_service.csv")
+
+  if(!fs::file_exists(NTD_SERVICE_FILE)){
+    library(httr2)
+  
+    request("https://data.transportation.gov/resource/4fir-qbim.csv") |>
+      req_url_query(`$query`=paste(
+        "SELECT  `_5_digit_ntd_id` AS `NTD_ID`", 
+        "`max_agency` AS `AGENCY`",
+        "`max_reporter_type` AS `reporter_type`",
+        "`max_organization_type` AS `organization_type`",
+        "`max_city` AS `city`",
+        "`max_state` AS `state`",
+        "`mode`",
+        "`type_of_service`",
+        "`max_primary_uza_code` as `uza_code`",
+        "`max_primary_uza_name` as `uza_name`",
+        "`max_primary_uza_area_sq_miles` as `uza_sq_miles`",
+        "`max_primary_uza_population` as `uza_population`",
+        "`max_service_area_sq_miles` as `service_area_sq_miles`",
+        "`max_service_area_population` as `service_area_population`",
+        "`questionable_record` as `flagged_likely_inaccurate`",
+        "`sum_unlinked_passenger_trips_upt` as `total_upt`",
+        "`sum_passenger_miles` WHERE caseless_one_of(`report_year`, '2025') limit 50000", 
+        sep=",")) |>
+      req_headers(
+        `User-Agent` = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:149.0) Gecko/20100101 Firefox/149.0") |> 
+      req_perform(NTD_SERVICE_FILE)
+  }
+  
+  if(file.info(NTD_SERVICE_FILE)$size < 1e4){
+        cat("I was unable to download the NTD Service File. Please try again.\n")
+        stop("Download failed. Please delete the corrupted file by running `unlink('data/mp02/2025_ntd_service.csv')` and try again.")
+    }
+
+  read_csv(NTD_SERVICE_FILE) |>
+    mutate(flagged_likely_inaccurate = !is.na(flagged_likely_inaccurate))
+}
+
+NTD_SERVICE <- load_ntd_service()
+```
+
+# Data Cleaning and Preparation
+Dataset was inspected using dplyr::glimpse() and skimr::skim(), by checking types (measurements should be numeric, and names and mode codes should be texts), missing values, and distributions(whether there are negatives, many zeros or ourliers)
+
+Two things deserve attention:
+- Agency IDs have different types: NTD ID is numeric in NTD_ENERGY, but NTD_ID is text in NTD_SERVICE. This will have to be aligned before joining. 
+- Bio-Diesel Description is numeric and entirely zero. 
+
+## Transit Mode Codes
+Based on National Transit Databse, Federal Transit Administration (FTA)'s definition [NTD glossary](https://www.transit.dot.gov/ntd/national-transit-database-ntd-glossary#U), Transit mode codes were translateed into readable names that are easier to work with.
+
+```{r recode-transit-modes}
+NTD_ENERGY <- NTD_ENERGY |>
+  mutate(Mode = recode_values(
+    Mode,
+    "AR" ~ "Alaska Railroad",
+    "CB" ~ "Commuter Bus",
+    "CC" ~ "Cable Car",
+    "CR" ~ "Commuter Rail",
+    "DR" ~ "Demand Response",
+    "FB" ~ "Ferryboat",
+    "HR" ~ "Heavy Rail",
+    "IP" ~ "Inclined Plane",
+    "LR" ~ "Light Rail",
+    "MB" ~ "Bus",
+    "MG" ~ "Monorail/Automated Guideway",
+    "RB" ~ "Bus Rapid Transit",
+    "SR" ~ "Streetcar Rail",
+    "TB" ~ "Trolleybus",
+    "TR" ~ "Aerial Tramway",
+    "VP" ~ "Vanpool",
+    "YR" ~ "Hybrid Rail",
+    default = "Unknown"
+  ))
+```
+
+# Data Integration and Initial Exploration
+### State Coverage in the Transit Service Data
+Before comparing states, it helps to know which states the transit service data actually covers. If a state has no records, it can't appear in any ranking or total, which could skew the analysis. This check compares the list of all 50 U.S. states against the states that appear in the 2025 Service by Agency data.
+```{r check-state-coverage}
+all_states <- tibble(
+  state = state.abb,
+  state_name = state.name
+)
+
+missing_states <- all_states |>
+  anti_join(
+    NTD_SERVICE |> distinct(state),
+    by = "state"
+  )
+
+coverage_answer <- if (nrow(missing_states) == 0) {
+  "All 50 U.S. states are represented in the transit service dataset."
+} else {
+  paste0(
+    "The transit service dataset is missing ",
+    nrow(missing_states),
+    " state(s): ",
+    paste(missing_states$state_name, collapse = ", "),
+    "."
+  )
+}
+```
+
+`r coverage_answer`
+
+## State Electricity Profiles
+
+### States with the Highest Retail Electricity Prices
+
+The analysis compares state average retail electricity prices to identify where electricity is most expensive. In the bar graph below, the eletricity price in Hawaii is significantly higher than other top 5 expensive states, because the state relies heavily on imported oil, which increases transportation and energy production costs. Its geographic isolation, small power grids, and high infrastructure maintenance costs also make electricity more expensive than on the U.S. mainland.
+
+```{r highest-electricity-prices}
+top5_prices <- EIA_SEP_REPORT |>
+  slice_max(
+    order_by = electricity_price_MWh,
+    n = 5,
+    with_ties = FALSE
+  )
+
+ggplot(
+  top5_prices,
+  aes(
+    x = reorder(state, electricity_price_MWh),
+    y = electricity_price_MWh
+  )
+) +
+  geom_col(fill = "#287D8E", width = 0.65) +
+  coord_flip() +
+  scale_y_continuous(labels = scales::label_dollar()) +
+  labs(
+    title = "Five States with the Highest Retail Electricity Prices",
+    subtitle = "Average retail price across customer sectors",
+    x = NULL,
+    y = "Electricity price (USD per MWh)",
+    caption = "Source: U.S. Energy Information Administration, State Electricity Profiles."
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(panel.grid.major.y = element_blank())
+```
+
+### States with the Highest Electricity Emissions Intensity
+
+Here are the top five states identified with the highest CO2 emissions per MWh of electricity generated. Emissions intensity measures how much CO2 is produced per unit of electricity, not the total emissions of a state.
+
+```{r dirtiest-electricity-states}
+top5_emissions <- EIA_SEP_REPORT |>
+  slice_max(
+    order_by = CO2_MWh,
+    n = 5,
+    with_ties = FALSE
+  ) |>
+  arrange(desc(CO2_MWh)) |>
+  select(state, primary_source, CO2_MWh)
+
+knitr::kable(
+  top5_emissions,
+  col.names = c(
+    "State",
+    "Primary Energy Source",
+    "CO₂ Emissions (lb/MWh)"
+  ),
+  digits = 0,
+  format.args = list(big.mark = ","),
+  caption = "Five states with the highest electricity emissions intensity. Source: U.S. Energy Information Administration, State Electricity Profiles."
+)
+```
+The four states with the highest electricity emissions intensity are West Virginia, Kentucky, Wyoming, and Missouri, which primarily rely on coal, while Hawaii relies on petroleum. This highlights how dependence on fossil fuels contributes to higher CO2 emissions per MWh of electricity generated.
+
+### Average U.S. Electricity Emissions Intensity
+
+The national average emissions intensity  is calculated by weighting each state's emissions rate by its electricity generation:
+
+$$
+\text{Weighted average}
+=
+\frac{\sum(\text{CO}_2\text{ per MWh} \times \text{MWh generated})}
+{\sum(\text{MWh generated})}
+$$
+
+
+```{r weighted-electricity-emissions}
+us_emissions_rate <- weighted.mean(
+  x = EIA_SEP_REPORT$CO2_MWh,
+  w = EIA_SEP_REPORT$generation_MWh
+)
+```
+
+Across the 50 states, electricity generation emits an average of **`r format(round(us_emissions_rate, 1), big.mark = ",")` pounds of CO2 per MWh**, weighted by each state's electricity generation.
+
+### Comparing New York and Texas
+
+- filter()：Select the state.
+- pull(CO2_MWh)：Extract its emissions rate.
+- texas_rate / ny_rate：Calculate the ratio.
+```{r compare-ny-texas}
+ny_rate <- EIA_SEP_REPORT |>
+  filter(abbreviation == "NY") |>
+  pull(CO2_MWh)
+
+texas_rate <- EIA_SEP_REPORT |>
+  filter(abbreviation == "TX") |>
+  pull(CO2_MWh)
+
+texas_ny_ratio <- texas_rate / ny_rate
+```
+
+Texas emits **`r round(texas_ny_ratio, 2)` times as much CO₂ per MWh** as New York: **`r texas_rate` lb/MWh** compared with **`r ny_rate` lb/MWh**.
+
+## Transit Energy Usage
+
+### Five Agencies with the Highest Fuel Consumption
+
+In this analysis fuel consumption across transportation modes for each agency were summed and identified the five largest users by total gallons consumed. Electricity and hydrogen are excluded because they are measured in different units.
+
+```{r top-five-fuel-users}
+agency_fuel <- NTD_ENERGY |>
+  group_by(`NTD ID`, `Agency Name`) |>
+  summarise(
+    across(starts_with("Gallons of"), sum),
+    .groups = "drop"
+  ) |>
+  mutate(
+    total_gallons = rowSums(
+      pick(starts_with("Gallons of"))
+    )
+  )
+
+top5_fuel <- agency_fuel |>
+  slice_max(
+    order_by = total_gallons,
+    n = 5,
+    with_ties = FALSE
+  ) |>
+  arrange(desc(total_gallons))
+
+fuel_breakdown <- top5_fuel |>
+  select(`Agency Name`, starts_with("Gallons of")) |>
+  pivot_longer(
+    cols = starts_with("Gallons of"),
+    names_to = "Fuel",
+    values_to = "Gallons"
+  ) |>
+  filter(Gallons > 0) |>
+  mutate(
+    Fuel = str_remove(Fuel, "^Gallons of ")
+  )
+
+knitr::kable(
+  fuel_breakdown,
+  col.names = c("Agency", "Fuel Type", "Gallons"),
+  digits = 0,
+  format.args = list(big.mark = ","),
+  caption = "Fuel consumption by type for the five largest fuel users, ranked by total gallons. Source: National Transit Database, 2025 Energy Consumption."
+)
+```
+High total fuel use does not necessarily mean poor efficiency, since agency size matters. For example, high service volume can potentially have higher total fuel use but have efficient fuel use.
+
+### Energy Use Across U.S. Public Transit
+
+Energy consumption is summarized across all agencies and modes. Separate panels distinguish fuels measured in gallons, electricity measured in kWh, and hydrogen measured in kilograms.
+
+```{r national-energy-use}
+#| fig-width: 12
+#| fig-height: 9
+#| out-width: "100%"
+#| column: page
+
+library(ggforce)
+
+national_energy <- NTD_ENERGY |>
+  summarise(
+    across(
+      c(
+        starts_with("Gallons of"),
+        starts_with("Kilowatt hours of"),
+        `Kilograms of Hydrogen`
+      ),
+      \(x) sum(x, na.rm = TRUE)
+    )
+  ) |>
+  pivot_longer(
+    cols = everything(),
+    names_to = "energy_source",
+    values_to = "total"
+  ) |>
+  mutate(
+    unit = case_when(
+      str_starts(energy_source, "Gallons of") ~ "Fuel (gallons)",
+      str_starts(energy_source, "Kilowatt hours of") ~ "Electricity (kWh)",
+      TRUE ~ "Hydrogen (kg)"
+    ),
+    energy_source = str_remove(
+      energy_source,
+      "^(Gallons of |Kilowatt hours of |Kilograms of )"
+    )
+  )
+
+ggplot(
+  national_energy,
+  aes(
+    x = total,
+    y = reorder(energy_source, total)
+  )
+) +
+  geom_col(fill = "#287D8E", width = 0.65) +
+  geom_text(
+    aes(label = scales::label_number(
+      scale_cut = scales::cut_short_scale(),
+      accuracy = 0.1
+    )(total)),
+    hjust = -0.1,
+    size = 3.5
+  ) +
+  facet_col(
+    vars(unit),
+    scales = "free",
+    space = "free"
+  ) +
+  scale_x_continuous(
+    labels = scales::label_number(scale_cut = scales::cut_short_scale()),
+    expand = expansion(mult = c(0, 0.15))
+  ) +
+  labs(
+    title = "Energy Use Across U.S. Public Transit",
+    subtitle = "2025 totals; compare quantities within each panel",
+    x = "Total consumption (unit shown in each panel)",
+    y = NULL,
+    caption = paste(
+      "Source: National Transit Database, 2025 Energy Consumption.",
+      "Zero totals reflect values in the processed dataset.",
+      sep = "\n"
+    )
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    panel.grid.major.y = element_blank(),
+    strip.text = element_text(face = "bold", hjust = 0)
+  )
+```
+The chart shows how much energy US public transit used in 2025. Transit systems get their energy in three different forms, each measured differently:
+
+- **Electricity** is measured in kilowatt-hours (kWh).
+- **Fuels** such as diesel and gasoline are measured in gallons.
+- **Hydrogen** is measured in kilograms.
+
+**Key takeaways:**
+
+1. **Electric propulsion accounts for most electricity use.** About 6.7 billion kWh goes to electric propulsion, such as subways, light rail, and electric trains. About 112 million kWh goes to battery-electric vehicles, such as electric buses. That is roughly 98% versus 2%.
+
+2. **Diesel is still the main fuel.** Transit agencies used about 438 million gallons of diesel, representing more than half of the total reported fuel volume measured in gallons. Compressed natural gas accounts for a bit over a quarter, followed by gasoline at about an eighth.
+
+3. **Other fuels are used in smaller amounts.** Biodiesel and propane (LPG) account for small shares. Ethanol and liquefied natural gas barely register, while kerosene and bunker fuel have zero recorded consumption in the cleaned data.
+
+4. **Hydrogen use is limited.** About 570 thousand kilograms are reported. Its bar looks long because that panel uses its own, much smaller scale.
+
+## Transit Service
+
+### States with the Fewest Reported Passenger Miles
+
+Reported passenger miles across transit services in each state are summed and the analysis will identify the five lowest totals. Missing records are excluded, so totals may understate actual travel.
+
+```{r fewest-state-passenger-miles}
+#| fig-width: 10
+#| fig-height: 5
+
+state_passenger_miles <- NTD_SERVICE |>
+  filter(state %in% state.abb) |>
+  group_by(state) |>
+  summarise(
+    reported_records = sum(!is.na(sum_passenger_miles)),
+    passenger_miles = if (
+      all(is.na(sum_passenger_miles))
+    ) NA_real_ else sum(sum_passenger_miles, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+bottom5_states <- state_passenger_miles |>
+  filter(!is.na(passenger_miles)) |>
+  slice_min(
+    order_by = passenger_miles,
+    n = 5,
+    with_ties = FALSE
+  ) |>
+  mutate(
+    state_name = state.name[match(state, state.abb)]
+  )
+
+ggplot(
+  bottom5_states,
+  aes(
+    x = passenger_miles,
+    y = reorder(state_name, -passenger_miles)
+  )
+) +
+  geom_col(fill = "#287D8E", width = 0.65) +
+  scale_x_continuous(
+    labels = scales::label_number(
+      scale_cut = scales::cut_short_scale()
+    )
+  ) +
+  labs(
+    title = "Five States with the Fewest Reported Transit Passenger Miles",
+    subtitle = "2025 totals from available passenger-mile records",
+    x = "Reported passenger miles",
+    y = NULL,
+    caption = paste(
+      "Source: National Transit Database, 2025 Service by Agency.",
+      "Missing records excluded; states with no passenger-mile data omitted.",
+      sep = "\n"
+    )
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(panel.grid.major.y = element_blank())
+```
+- South Dakota stands out as the lowest. Its total is less than half of the next state, New Hampshire.
+- The five states are mostly rural or have small transit systems. Fewer people live in places where transit is practical, so there are fewer riders and shorter routes. Most people in these states get around by car.
+- The graph presents a total, not a per-person number. States with small populations will naturally rank low. The chart doesn’t show whether people in these states ride transit more or less than elsewhere.
+- There could be possible gaps in the data since missing records are excluded and states with no passenger-mile data are left out. A state might look low because some agencies didn’t report, and a state with no data at all can’t appear. So these are the lowest reported totals, not guaranteed to be the lowest actual totals.
+
+## Data Integration Practice
+### How many UPTs were recorded in states where the primary energy source was nuclear power?
+```{r nuclear-state-upt}
+nuclear_states <- EIA_SEP_REPORT |>
+  filter(str_to_lower(primary_source) == "nuclear") |>
+  distinct(abbreviation)
+
+nuclear_upt <- NTD_SERVICE |>
+  semi_join(
+    nuclear_states,
+    by = c("state" = "abbreviation")
+  ) |>
+  summarise(total_upt = sum(total_upt)) |>
+  pull(total_upt)
+```
+
+Transit services located in states where nuclear power is the primary electricity source recorded **`r format(nuclear_upt, big.mark = ",", scientific = FALSE)` UPT** in 2025.
+
+### In what metro area were the most gallons of bio-diesel used by public transit agencies?
+Checking whether an agency is mapped to one metro area, and joining energy records to metro-area information using agency ID and mode.
+```{r biodiesel-metro-check}
+agency_metro <- NTD_SERVICE |>
+  distinct(NTD_ID, uza_name)
+
+# Check whether an agency maps to multiple metro areas
+multiple_metros <- agency_metro |>
+  count(NTD_ID) |>
+  filter(n > 1)
+
+multiple_metros
+```
+Check for agencies without matching metro information
+```{r biodiesel-by-metro}
+biodiesel_agencies <- NTD_ENERGY |>
+  group_by(`NTD ID`) |>
+  summarise(
+    biodiesel_gallons = sum(`Gallons of Bio-Diesel`),
+    .groups = "drop"
+  ) |>
+  mutate(
+    NTD_ID = str_pad(
+      as.character(`NTD ID`),
+      width = 5,
+      side = "left",
+      pad = "0"
+    )
+  )
+
+biodiesel_with_metro <- biodiesel_agencies |>
+  left_join(
+    agency_metro,
+    by = "NTD_ID",
+    relationship = "many-to-one"
+  )
+
+# Check for agencies without matching metro information
+biodiesel_with_metro |>
+  filter(is.na(uza_name))
+
+top_biodiesel_metro <- biodiesel_with_metro |>
+  filter(!is.na(uza_name)) |>
+  group_by(uza_name) |>
+  summarise(
+    biodiesel_gallons = sum(biodiesel_gallons),
+    .groups = "drop"
+  ) |>
+  slice_max(
+    biodiesel_gallons,
+    n = 1,
+    with_ties = TRUE
+  )
+
+knitr::kable(
+  top_biodiesel_metro,
+  col.names = c("Metro Area", "Biodiesel (gallons)"),
+  digits = 0,
+  format.args = list(big.mark = ",")
+)
+```
+
+# Data Analysis
+
+## Calculating total transit emissions associated with each agency and mode pair
+
+Combine energy consumption, transit service, and state electricity data using agency identifiers, transit modes, and state abbreviations to calculate total emissions.
+
+```{r calculate-transit-emissions}
+# 1. Match service mode codes to energy mode names
+mode_lookup <- c(
+  AR = "Alaska Railroad",
+  CB = "Commuter Bus",
+  CC = "Cable Car",
+  CR = "Commuter Rail",
+  DR = "Demand Response",
+  FB = "Ferryboat",
+  HR = "Heavy Rail",
+  IP = "Inclined Plane",
+  LR = "Light Rail",
+  MB = "Bus",
+  MG = "Monorail/Automated Guideway",
+  RB = "Bus Rapid Transit",
+  SR = "Streetcar Rail",
+  TB = "Trolleybus",
+  TR = "Aerial Tramway",
+  VP = "Vanpool",
+  YR = "Hybrid Rail"
+)
+
+service_for_join <- NTD_SERVICE |>
+  mutate(Mode = unname(mode_lookup[mode]))
+
+stopifnot(!anyNA(service_for_join$Mode))
+
+# 2. Standardize agency IDs without changing the original table
+energy_for_join <- NTD_ENERGY |>
+  mutate(
+    NTD_ID = str_pad(
+      as.character(`NTD ID`),
+      width = 5,
+      side = "left",
+      pad = "0"
+    )
+  )
+
+# 3. Check that each agency-mode pair has one known state
+state_conflicts <- service_for_join |>
+  group_by(NTD_ID, Mode) |>
+  summarise(
+    number_of_states = n_distinct(state),
+    missing_state = any(is.na(state)),
+    .groups = "drop"
+  ) |>
+  filter(number_of_states != 1 | missing_state)
+
+stopifnot(nrow(state_conflicts) == 0)
+
+# 4. Aggregate service types before joining
+# Preserve NA if passenger-mile coverage is incomplete
+service_by_mode <- service_for_join |>
+  group_by(NTD_ID, Mode) |>
+  summarise(
+    state = first(state),
+    total_upt = sum(total_upt),
+    passenger_miles = if (
+      any(is.na(sum_passenger_miles))
+    ) NA_real_ else sum(sum_passenger_miles),
+    flagged_likely_inaccurate = any(flagged_likely_inaccurate),
+    .groups = "drop"
+  )
+
+# 5. Join the three datasets
+transit_combined <- energy_for_join |>
+  left_join(
+    service_by_mode,
+    by = c("NTD_ID", "Mode"),
+    relationship = "one-to-one"
+  ) |>
+  left_join(
+    EIA_SEP_REPORT |>
+      select(abbreviation, CO2_MWh),
+    by = c("state" = "abbreviation"),
+    relationship = "many-to-one"
+  )
+
+stopifnot(
+  nrow(transit_combined) == nrow(energy_for_join),
+  !anyNA(transit_combined$state)
+)
+
+# Inspect missing electricity factors
+join_issues <- transit_combined |>
+  filter(is.na(CO2_MWh)) |>
+  select(NTD_ID, `Agency Name`, Mode, state, CO2_MWh)
+
+join_issues |> count(state, sort = TRUE)
+
+# 6. Restrict the comparison to agencies located in the 50 states
+transit_analysis <- transit_combined |>
+  filter(state %in% state.abb)
+
+stopifnot(!anyNA(transit_analysis$CO2_MWh))
+
+# 7. Define conversion factors in pounds CO2 per reported unit
+kg_to_lb <- 2.2046226218
+
+ef_diesel <- 22.45
+ef_gasoline <- 18.73
+ef_bunker <- 24.78       # Residual fuel oil proxy
+ef_kerosene <- 21.78
+ef_lpg <- 12.68          # Propane proxy
+ef_biodiesel <- 9.45 * kg_to_lb  # Pure biodiesel approximation
+ef_ethanol <- 5.75 * kg_to_lb    # Pure ethanol approximation
+ef_lng <- 4.50 * kg_to_lb       # Per physical gallon of LNG
+ef_hydrogen <- 0                # Direct CO2 only
+
+# CNG baseline: assume diesel gallon equivalents
+# EIA natural gas: 116.65 lb CO2 per million Btu
+# NTD: one DGE = 138,000 Btu
+ef_cng_dge <- 116.65 * 0.138
+
+# Alternative for sensitivity analysis: gasoline gallon equivalents
+ef_cng_gge <- 116.65 * 0.114
+
+# 8. Calculate emissions for each agency-mode pair
+transit_analysis <- transit_analysis |>
+  mutate(
+    electricity_kwh =
+      `Kilowatt hours of Electric Battery` +
+      `Kilowatt hours of Electric Propulsion`,
+
+    electricity_emissions_lb =
+      electricity_kwh / 1000 * CO2_MWh,
+
+    fuel_emissions_lb =
+      `Gallons of Bio-Diesel` * ef_biodiesel +
+      `Gallons of Bunker Fuel` * ef_bunker +
+      `Gallons of Compressed Natural Gas` * ef_cng_dge +
+      `Gallons of Diesel Fuel` * ef_diesel +
+      `Gallons of Ethanol` * ef_ethanol +
+      `Gallons of Gasoline` * ef_gasoline +
+      `Kilograms of Hydrogen` * ef_hydrogen +
+      `Gallons of Kerosene` * ef_kerosene +
+      `Gallons of Liquified Nat Gas` * ef_lng +
+      `Gallons of Liquified Petroleum Gas` * ef_lpg,
+
+    total_emissions_lb =
+      fuel_emissions_lb + electricity_emissions_lb,
+
+    total_emissions_metric_tons =
+      total_emissions_lb / kg_to_lb / 1000,
+
+    # Alternative total if CNG was reported in GGE
+    total_emissions_lb_cng_gge =
+      total_emissions_lb +
+      `Gallons of Compressed Natural Gas` *
+      (ef_cng_gge - ef_cng_dge)
+  )
+
+# 9. Check calculated results
+stopifnot(
+  !anyNA(transit_analysis$total_emissions_lb),
+  all(is.finite(transit_analysis$total_emissions_lb)),
+  all(transit_analysis$total_emissions_lb >= 0),
+  !anyDuplicated(transit_analysis[c("NTD_ID", "Mode")])
+)
+
+# Preview selected columns; all fuel columns remain in transit_analysis
+# Include every energy quantity from the original energy table
+fuel_columns <- names(NTD_ENERGY) |>
+  stringr::str_subset(
+    "^(Gallons of|Kilowatt hours of|Kilograms of)"
+  )
+
+task5_table <- transit_analysis |>
+  select(
+    NTD_ID,
+    `Agency Name`,
+    Mode,
+    state,
+    all_of(fuel_columns),
+    CO2_MWh,
+    total_emissions_lb
+  )
+
+# Show the complete table with horizontal scrolling
+table_html <- knitr::kable(
+  task5_table,
+  format = "html",
+  row.names = FALSE,
+  digits = 2,
+  format.args = list(big.mark = ","),
+  table.attr = 'style="white-space: nowrap;"',
+  caption = paste(
+    "Emissions by agency and mode.",
+    "Energy quantities retain their original units;",
+    "CO2_MWh: lb CO₂/MWh;",
+    "total_emissions_lb: lb CO₂."
+  )
+)
+
+knitr::asis_output(
+  paste0(
+    '<div style="overflow: auto; max-height: 600px; width: 100%;">',
+    table_html,
+    '</div>'
+  )
+)
+```
+
+### Estimation Assumptions and Limitations
+
+The analysis excludes agencies reported in Washington, D.C., and Puerto Rico because electricity emissions factors for those locations are unavailable in the 50-state electricity table.
+
+Fuel coefficients primarily follow the [EIA emissions coefficients](https://www.eia.gov/environment/emissions/co2_vol_mass.php), supplemented by [EPA factors](https://www.epa.gov/sites/default/files/2021-04/documents/emission-factors_apr2021.pdf) for biodiesel, ethanol, and LNG. Bunker fuel is approximated using residual fuel oil, and LPG using propane.
+
+CNG is assumed to be reported in diesel gallon equivalents; an alternative gasoline-equivalent estimate is retained for sensitivity analysis. LNG is treated as physical gallons. Biodiesel and ethanol use pure-fuel approximations because blend information is not retained in the processed table.
+
+Estimates include direct fuel CO₂ and state-average electricity-generation CO₂. They include biogenic combustion CO₂ for separately reported biofuels, exclude hydrogen-production emissions, and are not full life-cycle estimates. The gasoline factor follows EIA's finished-motor-gasoline accounting, which excludes biogenic ethanol CO₂. Fuel types removed by the instructor's import function are outside this estimate.
+
+## Emissions Relative to Passenger Service
+
+For each agency, emissions and passenger service across transportation modes are aggregated, then comparing estimated CO₂ emissions per boarding and per passenger mile.
+
+```{r normalize-agency-emissions}
+# 1. Check whether all reported modes have matching energy records
+mode_coverage <- service_by_mode |>
+  filter(state %in% state.abb) |>
+  left_join(
+    transit_analysis |>
+      distinct(NTD_ID, Mode) |>
+      mutate(has_energy = TRUE),
+    by = c("NTD_ID", "Mode"),
+    relationship = "one-to-one"
+  ) |>
+  group_by(NTD_ID) |>
+  summarise(
+    complete_energy_coverage = all(!is.na(has_energy)),
+    .groups = "drop"
+  )
+
+# 2. Sum emissions and service across modes within each agency
+agency_efficiency <- transit_analysis |>
+  group_by(NTD_ID) |>
+  summarise(
+    agency = first(`Agency Name`),
+    state = first(state),
+    total_emissions_lb = sum(total_emissions_lb),
+    total_upt = sum(total_upt),
+
+    # Preserve missingness if any mode has incomplete passenger miles
+    passenger_miles = if (
+      any(is.na(passenger_miles))
+    ) NA_real_ else sum(passenger_miles),
+
+    flagged_likely_inaccurate = any(flagged_likely_inaccurate),
+    .groups = "drop"
+  ) |>
+  left_join(
+    mode_coverage,
+    by = "NTD_ID",
+    relationship = "one-to-one"
+  ) |>
+  mutate(
+    emissions_per_upt =
+      total_emissions_lb / na_if(total_upt, 0),
+
+    emissions_per_passenger_mile =
+      total_emissions_lb / na_if(passenger_miles, 0),
+
+    size_category = case_when(
+      total_upt < 1000000 ~ "Small",
+      total_upt < 10000000 ~ "Medium",
+      TRUE ~ "Large"
+    )
+  )
+
+# 3. Apply comparison rules
+eligible_agencies <- agency_efficiency |>
+  filter(
+    complete_energy_coverage,
+    !flagged_likely_inaccurate,
+    total_upt >= 100000,
+    total_emissions_lb > 0
+  )
+
+# 4. Rank agencies by emissions per boarding
+upt_ranking <- eligible_agencies |>
+  filter(is.finite(emissions_per_upt)) |>
+  arrange(emissions_per_upt, NTD_ID)
+
+upt_ranking |>
+  slice_head(n = 5) |>
+  select(
+    agency,
+    size_category,
+    total_upt,
+    emissions_per_upt
+  ) |>
+  knitr::kable(
+    col.names = c(
+      "Agency",
+      "Size",
+      "Annual UPT",
+      "CO₂ per UPT (lb)"
+    ),
+    digits = 3,
+    format.args = list(big.mark = ","),
+    caption = "Five eligible agencies with the lowest estimated emissions per boarding."
+  )
+
+# 5. Rank agencies by emissions per passenger mile
+mile_ranking <- eligible_agencies |>
+  filter(
+    !is.na(passenger_miles),
+    passenger_miles > 0,
+    is.finite(emissions_per_passenger_mile)
+  ) |>
+  arrange(emissions_per_passenger_mile, NTD_ID)
+
+mile_ranking |>
+  slice_head(n = 5) |>
+  select(
+    agency,
+    size_category,
+    passenger_miles,
+    emissions_per_passenger_mile
+  ) |>
+  knitr::kable(
+    col.names = c(
+      "Agency",
+      "Size",
+      "Passenger Miles",
+      "CO₂ per Passenger Mile (lb)"
+    ),
+    digits = 3,
+    format.args = list(big.mark = ","),
+    caption = "Five eligible agencies with the lowest estimated emissions per passenger mile."
+  )
+```
+### Most Efficient Agencies
+
+Among eligible agencies, **`r upt_ranking$agency[1]`** has the lowest estimated emissions per UPT, at **`r round(upt_ranking$emissions_per_upt[1], 3)` lb CO₂ per boarding**.
+
+**`r mile_ranking$agency[1]`** has the lowest estimated emissions per passenger mile, at **`r round(mile_ranking$emissions_per_passenger_mile[1], 3)` lb CO₂ per passenger mile**.
+
+These results use agency-level totals summed across transportation modes and apply the eligibility rules described above.
+### Most Efficient Agencies by Size
+
+```{r efficiency-winners-by-size}
+size_winners <- bind_rows(
+  upt_ranking |>
+    group_by(size_category) |>
+    slice_min(emissions_per_upt, n = 1, with_ties = TRUE) |>
+    ungroup() |>
+    transmute(
+      Size = size_category,
+      Metric = "CO₂ per UPT",
+      Agency = agency,
+      `Emissions (lb)` = emissions_per_upt
+    ),
+
+  mile_ranking |>
+    group_by(size_category) |>
+    slice_min(
+      emissions_per_passenger_mile,
+      n = 1,
+      with_ties = TRUE
+    ) |>
+    ungroup() |>
+    transmute(
+      Size = size_category,
+      Metric = "CO₂ per passenger mile",
+      Agency = agency,
+      `Emissions (lb)` = emissions_per_passenger_mile
+    )
+) |>
+  mutate(Size = factor(Size, levels = c("Small", "Medium", "Large"))) |>
+  arrange(Metric, Size)
+
+knitr::kable(
+  size_winners,
+  digits = 3,
+  caption = "Lowest estimated emissions within each agency size category."
+)
+```
+### Comparison Rules and Limitations
+
+We require at least 100,000 annual UPT to limit the influence of extremely small services. Agencies must have positive estimated emissions, matching energy records for every reported mode, and no flagged service records. The passenger-mile ranking additionally requires complete, positive passenger-mile totals.
+
+For this analysis, small agencies provide fewer than 1 million annual UPT, medium agencies provide 1 million to fewer than 10 million, and large agencies provide at least 10 million. These thresholds are analytical choices, not official NTD classifications.
+
+A matching energy record does not guarantee complete energy reporting. 
+                                    
+## Greenest Transit Agency Award
+
+```{r award-values}
+#| include: false
+# Greenest agency: lowest CO2 per passenger mile among eligible agencies
+greenest_winners <- mile_ranking |>
+  slice_min(emissions_per_passenger_mile, n = 1, with_ties = TRUE)
+greenest_names     <- paste(greenest_winners$agency, collapse = "; ")
+greenest_value     <- greenest_winners$emissions_per_passenger_mile[1]
+greenest_reference <- median(mile_ranking$emissions_per_passenger_mile)
+greenest_reduction <- scales::percent(
+  1 - greenest_value / greenest_reference, accuracy = 0.1
+)
+# Large-agency boarding award: lowest CO2 per UPT among agencies with >= 10M UPT
+large_upt_ranking <- upt_ranking |>
+  filter(total_upt >= 10000000)
+large_boarding_winners <- large_upt_ranking |>
+  slice_min(emissions_per_upt, n = 1, with_ties = TRUE)
+boarding_names           <- paste(large_boarding_winners$agency, collapse = "; ")
+boarding_value           <- large_boarding_winners$emissions_per_upt[1]
+large_boarding_reference <- median(large_upt_ranking$emissions_per_upt)
+boarding_reduction       <- scales::percent(
+  1 - boarding_value / large_boarding_reference, accuracy = 0.1
+)
+```
+# Green Transit Alliance Announces Its Green Transit Award Recipients
+**FOR IMMEDIATE RELEASE**
+The Green Transit Alliance recognizes **`r greenest_names`** with its Greenest Transit Agency Award and **`r boarding_names`** with its Large-Agency Low-Carbon Boarding Award. Drawing on 2025 transit energy and service records and state electricity emissions data, the awards recognize low estimated carbon emissions per passenger mile and per boarding.
+## Greenest Transit Agency Award
+**`r greenest_names`** receives the Greenest Transit Agency Award, with an estimated **`r sprintf("%.3f", greenest_value)` pounds of CO₂ per passenger mile**. This is **`r greenest_reduction` below** the eligible-agency median of **`r sprintf("%.3f", greenest_reference)` pounds**.
+The metric divides total estimated agency emissions by total passenger miles, after summing across transportation modes. Lower values mean less estimated CO₂ for each passenger transported one mile.
+```{r greenest-award-graphic}
+#| fig-width: 11
+#| fig-height: 5.5
+#| out-width: "100%"
+#| column: page
+greenest_plot_data <- tibble(
+  comparison = factor(c("Recipient(s)", "Peer median"),
+                      levels = c("Peer median", "Recipient(s)")),
+  value = c(greenest_value, greenest_reference),
+  display_name = c(str_wrap(greenest_names, 32), "Eligible-agency median")
+)
+ggplot(greenest_plot_data, aes(value, comparison, fill = comparison)) +
+  geom_col(width = 0.55) +
+  geom_text(aes(label = sprintf("%.3f", value)), hjust = -0.15, size = 4.5) +
+  scale_y_discrete(labels = setNames(greenest_plot_data$display_name,
+                                    as.character(greenest_plot_data$comparison))) +
+  scale_fill_manual(values = c("Recipient(s)" = "#167D8D", "Peer median" = "#A8AFB5")) +
+  scale_x_continuous(expand = expansion(mult = c(0, 0.25))) +
+  labs(
+    title = "Greenest Transit Agency",
+    subtitle = paste0(greenest_reduction, " below the eligible-agency median; lower is better"),
+    x = "Estimated CO2 per passenger mile (lb)", y = NULL,
+    caption = paste(
+      "Sources: FTA NTD, 2025 Energy Consumption and Service by Agency;",
+      "EIA State Electricity Profiles and fuel coefficients; EPA supplemental fuel coefficients.",
+      "Eligible agencies have complete passenger-mile data and meet Task 6 reporting rules.",
+      "Estimates include direct fuel and electricity-generation CO2, not full life-cycle emissions.",
+      sep = "\n"
+    )
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "none", panel.grid.major.y = element_blank(),
+        panel.grid.minor = element_blank(),
+        plot.title = element_text(face = "bold", size = 19),
+        plot.caption = element_text(hjust = 0, size = 9))
+```
+## Large-Agency Low-Carbon Boarding Award
+**`r boarding_names`** receives the Large-Agency Low-Carbon Boarding Award, with an estimated **`r sprintf("%.3f", boarding_value)` pounds of CO₂ per boarding**. This is **`r boarding_reduction` below** the eligible large-agency median of **`r sprintf("%.3f", large_boarding_reference)` pounds**.
+The award divides total estimated emissions by total annual UPT after summing across modes. It recognizes low emissions per boarding among agencies providing at least 10 million annual boardings. UPT counts each boarding separately, including transfers; it does not count unique passengers or complete origin-to-destination journeys.
+```{r large-boarding-award-graphic}
+#| fig-width: 12
+#| fig-height: 7
+#| out-width: "100%"
+#| column: page
+# Show the ten lowest-emission large agencies and all tied winners.
+boarding_plot_data <- large_upt_ranking |>
+  slice_min(emissions_per_upt, n = 10, with_ties = TRUE) |>
+  mutate(
+    recipient = NTD_ID %in% large_boarding_winners$NTD_ID,
+
+## About the Analysis
+Eligible agencies provide at least 100,000 annual boardings, have positive estimated emissions, have matching energy records for every reported mode, and have no flagged service records. The Greenest Transit Agency award additionally requires complete, positive passenger-mile totals. The Large-Agency Low-Carbon Boarding Award requires at least 10 million annual boardings but does not require passenger-mile totals. Ties receive shared recognition.
+The analysis covers agencies reported in the 50 U.S. states and excludes those reported in Washington, D.C., and Puerto Rico. Estimates include direct fuel CO₂ and state-average electricity-generation CO₂, subject to the fuel assumptions documented in Task 5. They are not full life-cycle estimates. Reporting limitations affect eligibility and comparisons; matching energy records do not independently establish complete energy reporting.
+**Sources:** [FTA National Transit Database](https://www.transit.dot.gov/ntd/ntd-data), 2025 Energy Consumption and Service by Agency; [EIA State Electricity Profiles](https://www.eia.gov/electricity/state/); [EIA emissions coefficients](https://www.eia.gov/environment/emissions/co2_vol_mass.php); [EPA supplemental fuel coefficients](https://www.epa.gov/sites/default/files/2021-04/documents/emission-factors_apr2021.pdf).
+
+
+
+::: {.callout-note title="AI Usage Statement" collapse="true"}
+ChatGPT and Claude were used to assist with coding, debugging, and organizing the author's original thoughts (brainstorming).
+:::
